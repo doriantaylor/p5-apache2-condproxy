@@ -1,0 +1,3 @@
+PerlFixupHandler Apache2::CondProxy
+PerlSetVar ProxyTarget htpt://www.google.com/
+PerlSetVar RequestBodyCache @ServerRoot@/tmp
