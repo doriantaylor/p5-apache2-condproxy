@@ -9,6 +9,8 @@ license  'apache';
 build_requires 'Test::More';
 build_requires 'Apache::Test';
 
+clean_files 't/TEST t/SMOKE';
+
 require Apache::TestMM;
 Apache::TestMM->import(qw(test clean));
 

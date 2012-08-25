@@ -35,7 +35,7 @@ our $VERSION = '0.01';
 =head1 SYNOPSIS
 
     # httpd.conf
-    PerlFixupHandler +Apache2::CondProxy
+    PerlFixupHandler Apache2::CondProxy
     PerlSetVar ProxyTarget http://other.host/
     PerlSetVar RequestBodyCache /tmp
 
@@ -47,9 +47,9 @@ the following Apache configuration:
     # httpd.conf
     RewriteEngine On
     RewriteCond %{REQUEST_URI} !-U
-    RewriteRule (.*) http://some.host$1 [P,NS]
+    RewriteRule (.*) http://another.host$1 [P,NS]
 
-Which says I<if I can't respond to a given request, try some.host>.
+Which says I<if I can't respond to a given request, try another.host>.
 Unfortunately, the architecture of mod_rewrite, as well as the design
 of Apache's handler model itself, prohibits this. In the first case,
 all C<RewriteCond> directives are evaluated I<after> the associated
@@ -66,25 +66,21 @@ is redirected to the proxy target.
 
 =cut
 
-sub new {
-    my ($class, $r) = @_;
-    bless { r => $r }, $class;
-}
-
 sub handler :method {
-    my ($self, $r) = @_;
+    my $r = ref $_[0] ? $_[0] : bless { r => $_[1] }, $_[0];
 
     if ($r->is_initial_req) {
         my $subr = $r->lookup_uri($r->uri);
         # we don't need to run the response handler if the response is
         # already an error
-        return $r->do_proxy if _is_error($subr->status);
+        return $r->do_proxy if $r->_is_error($subr->status);
 
         # set up filters
         $subr->add_input_filter(\&_trap_input);
         $subr->add_output_filter(\&_trap_output);
         my $status = $subr->run;
-        return $r->do_proxy if _is_error($status);
+        $r->log->debug($status);
+        return $r->do_proxy if $r->_is_error($status);
     }
 
     Apache2::Const::DECLINED;
@@ -93,18 +89,21 @@ sub handler :method {
 sub do_proxy {
     my $r = shift;
     my $base = $r->dir_config('ProxyTarget');
+    $r->log->debug($base);
     # TODO: deal with potentially missing or malformed target
 
     $r->filename(sprintf 'proxy:%s%s', $base, $r->uri);
+    $r->log->debug($r->filename);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
-    $r->handler('proxy-server');
+    # duh, we redefine $r->handler above
+    $r->SUPER::handler('proxy-server');
 
     # TODO: resurrect request body if one is present
 
     Apache2::Const::OK;
 }
 
-sub _trap_input :FilterRequestHandler {
+sub _trap_input {
     my ($f, $bb) = @_;
     my $r = $f->r;
 
@@ -115,18 +114,20 @@ sub _trap_input :FilterRequestHandler {
 
 # read the cached input back into the input stream
 
-sub _resurrect_input :FilterRequestHandler {
+sub _resurrect_input {
     my ($f, $bb) = @_;
     my $r = $f->r;
 
     Apache2::Const::OK;
 }
 
-sub _trap_output :FilterRequestHandler {
+sub _trap_output {
     my ($f, $bb) = @_;
     my $r = $f->r;
 
-    if (_is_error($r->status)) {
+#    warn $r;
+
+    if (_is_error($r, $r->status)) {
         $r->log->debug
             (__PACKAGE__ . ' output filter: dropping subrequest body');
         $bb->destroy;
@@ -137,7 +138,10 @@ sub _trap_output :FilterRequestHandler {
 
 # what our configuration considers an error
 sub _is_error {
-    my $r = shift;
+    my ($r, $code) = @_;
+    $code ||= $r->status;
+
+    $code == 404;
 }
 
 =head1 AUTHOR
@@ -146,19 +150,17 @@ Dorian Taylor, C<< <dorian at cpan.org> >>
 
 =head1 BUGS
 
-Please report any bugs or feature requests to C<bug-apache2-condproxy at rt.cpan.org>, or through
-the web interface at L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Apache2-CondProxy>.  I will be notified, and then you'll
-automatically be notified of progress on your bug as I make changes.
-
-
-
+Please report any bugs or feature requests to C<bug-apache2-condproxy
+at rt.cpan.org>, or through the web interface at
+L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Apache2-CondProxy>.
+I will be notified, and then you'll automatically be notified of
+progress on your bug as I make changes.
 
 =head1 SUPPORT
 
 You can find documentation for this module with the perldoc command.
 
     perldoc Apache2::CondProxy
-
 
 You can also look for information at:
 
@@ -182,25 +184,20 @@ L<http://search.cpan.org/dist/Apache2-CondProxy/>
 
 =back
 
-
-=head1 ACKNOWLEDGEMENTS
-
-
 =head1 LICENSE AND COPYRIGHT
 
 Copyright 2012 Dorian Taylor.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    L<http://www.apache.org/licenses/LICENSE-2.0>
+Licensed under the Apache License, Version 2.0 (the "License"); you
+may not use this file except in compliance with the License.  You may
+obtain a copy of the License at
+L<http://www.apache.org/licenses/LICENSE-2.0>
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied.  See the License for the specific language governing
+permissions and limitations under the License.
 
 
 =cut
