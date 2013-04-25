@@ -11,3 +11,8 @@ pm_to_blib*
 cover_db
 pod2htm*.tmp
 Apache2-CondProxy-*
+t/conf/*.{pl,conf}
+t/tmp
+t/{SMOKE,TEST}
+inc/*
+{,MY}META.*

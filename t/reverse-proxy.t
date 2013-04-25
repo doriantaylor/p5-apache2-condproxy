@@ -10,4 +10,5 @@ plan test => 2;#,
 #    need_module qw(mod_proxy.c mod_proxy_http.c mod_proxy_connect.c);
 
 ok GET_OK('/index.html');
+
 ok GET_OK('/');

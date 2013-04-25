@@ -3,7 +3,19 @@ LoadModule proxy_module @src_dir@/mod_proxy.so
 LoadModule proxy_http_module @src_dir@/mod_proxy_http.so
 LoadModule proxy_connect_module @src_dir@/mod_proxy_connect.so
 
-PerlModule Apache2::CondProxy
+<IfModule !mod_cgi.c>
+LoadModule cgi_module @src_dir@/mod_cgi.so
+#ScriptSock @t_logs@/cgisock
+</IfModule>
+
+PerlLoadModule Apache2::CondProxy
 PerlFixupHandler Apache2::CondProxy
 PerlSetVar ProxyTarget http://iainstitute.org
 PerlSetVar RequestBodyCache @ServerRoot@/tmp
+
+<Directory "@DocumentRoot@">
+AddHandler cgi-script .cgi
+Options +ExecCGI
+# +MultiViews
+#DirectoryIndex index
+</Directory>

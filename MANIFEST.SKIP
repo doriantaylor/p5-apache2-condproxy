@@ -1,8 +1,8 @@
-^inc/
 ^\.hg
 ^\.gitignore
 ^Makefile$
 ^MANIFEST\.bak$
+^blib.*
 t/conf/apache_test_config.pm$
 t/conf/extra.last.conf$
 t/conf/httpd.conf$
@@ -10,8 +10,8 @@ t/conf/mime.types$
 t/conf/modperl_inc.pl$
 t/conf/modperl_startup.pl$
 t/htdocs/index.html
-t/logs/access_log
-t/logs/error_log
+t/logs.*
 t/SMOKE$
 t/TEST$
-
+t/tmp.*
+Apache2-Condproxy-.*
