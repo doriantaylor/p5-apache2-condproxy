@@ -15,7 +15,7 @@ use APR::Table           ();
 use APR::Bucket          ();
 use APR::Brigade         ();
 
-use Apache2::Const -compile => qw(OK DECLINED PROXYREQ_REVERSE);
+use Apache2::Const -compile => qw(OK DECLINED SERVER_ERROR PROXYREQ_REVERSE);
 use APR::Const     -compile => qw(:common);
 
 use File::Spec  ();
@@ -30,11 +30,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.02
+Version 0.03
 
 =cut
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 
 =head1 SYNOPSIS
@@ -75,8 +75,7 @@ sub handler :method {
     my $r = ref $_[0] ? $_[0] : bless { r => $_[1] }, $_[0];
 
     if ($r->is_initial_req) {
-        # remove Accept-Encoding
-
+        # XXX do something smarter with Accept-Encoding than removing it
         my $hdr = $r->headers_in;
         my @enc = $hdr->get('Accept-Encoding');
         $hdr->unset('Accept-Encoding');
@@ -86,30 +85,22 @@ sub handler :method {
         # already an error
 
         if ($r->_is_error($subr->status)) {
-            #map { $hdr->add('Accept-Encoding', $_) } @enc;
             return $r->do_proxy;
         }
 
-#        return $r->do_proxy if $r->_is_error($subr->status);
-
-#        $r->log->debug(sprintf 'Subrequest status code before handler: %d',
-#                       $subr->status);
-
         # set up filters
-        $subr->add_input_filter(\&_trap_input);
+        #$subr->add_input_filter(\&_trap_input);
         $subr->add_output_filter(\&_trap_output);
 
         # run the subrequest
         my $return = $subr->run;
-        $r->log->debug($return);
-
-        # put the header back on unconditionally
-        #map { $hdr->add('Accept-Encoding', $_) } @enc;
+        #$r->log->debug($return);
 
         # use the RETURN VALUE from the subreq not its ->status
         return $r->do_proxy if $r->_is_error($return);
     }
 
+    # shhh we weren't really here
     Apache2::Const::DECLINED;
 }
 
@@ -125,6 +116,7 @@ sub do_proxy {
     $r->log->debug("Proxying to " . $r->filename);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     # duh, we redefine $r->handler above. I guess this isn't the best
+    # name for it.
     $r->SUPER::handler('proxy-server');
 
     # TODO: resurrect request body if one is present
@@ -137,16 +129,29 @@ sub _trap_input {
     my $c = $f->c;
     my $r = $f->r;
 
-    warn $readbytes;
+    $r->log->debug("Trapping $readbytes of input");
 
-    $r->log->debug('running trap input filter');
+    my $tmp = $f->ctx;
+    unless ($tmp) {
+        # XXX this is an error unless $dir is writable
+        my $dir = Path::Class::Dir->new
+            ($r->dir_config('RequestBodyCache') || File::Spec->tmpdir);
 
-    # XXX this is an error unless $dir is writable
-    my $dir = Path::Class::Dir->new
-        ($r->dir_config('RequestBodyCache') || File::Spec->tmpdir);
+        # XXX test this
+        eval { $dir->mkpath };
+        if ($@) {
+            $r->log->crit("Cannot make directory $dir: $@");
+            return Apache2::Const::SERVER_ERROR;
+        }
 
-    # XXX test this
-    $dir->mkpath;
+        ($tmp, my $fn) = $dir->tempfile(OPEN => 1);
+        $r->log->debug("Opening $tmp");
+        unless ($tmp) {
+            $r->log->crit("Cannot open temporary file $tmp");
+            return Apache2::Const::SERVER_ERROR;
+        }
+        $f->ctx($tmp);
+    }
 
     # create a new brigade
     my $bb_ctx = APR::Brigade->new($c->pool, $c->bucket_alloc);
@@ -157,12 +162,6 @@ sub _trap_input {
 
     unless ($bb_ctx->is_empty) {
         # store the tempfile
-        my $tmp = $r->pnotes(__PACKAGE__ . '::TMPFILE');
-        unless ($tmp) {
-            ($tmp, my $fn) = $dir->tempfile(OPEN => 1);
-            warn $fn;
-            $r->pnotes(__PACKAGE__ . '::TMPFILE', $tmp);
-        }
 
         while (!$bb_ctx->is_empty) {
             my $b = $bb_ctx->first;
@@ -170,6 +169,7 @@ sub _trap_input {
             $b->remove;
             if ($b->is_eos) {
                 $bb->insert_tail($b);
+                $tmp->close;
                 last;
             }
 
@@ -209,16 +209,29 @@ sub _resurrect_input {
 sub _trap_output {
     my ($f, $bb) = @_;
     my $r = $f->r;
+    my $c = $f->c;
 
     $r->log->debug("derp derp " . $r->status);
 
-    $bb->flatten(my $dur);
-    #$r->log->debug($dur);
+    # XXX this is a cargo cult. I have no idea if this deep-sixes the
+    # output but it seems to send it twice if I don't.
+    my $new_bb = APR::Brigade->new($c->pool, $c->bucket_alloc);
+    until ($bb->is_empty) {
+        my $b = $bb->first;
+        $b->remove;
+        $new_bb->insert_tail($bb);
+    }
+    $bb->destroy;
 
     if (_is_error($r, $r->status)) {
         $r->log->debug
             (__PACKAGE__ . ' output filter: dropping subrequest body');
-        # $bb->destroy;
+        #$bb->destroy;
+        #return Apache2::Const::OK;
+        $new_bb->destroy;
+    }
+    else {
+        $f->next->pass_brigade($new_bb);
     }
 
     Apache2::Const::OK;

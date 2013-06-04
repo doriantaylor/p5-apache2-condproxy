@@ -1,4 +1,5 @@
 # XXX figure out how to do this a non-ridiculous way
+LoadModule negotiation_module @src_dir@/mod_negotiation.so
 LoadModule proxy_module @src_dir@/mod_proxy.so
 LoadModule proxy_http_module @src_dir@/mod_proxy_http.so
 LoadModule proxy_connect_module @src_dir@/mod_proxy_connect.so
@@ -14,8 +15,8 @@ PerlSetVar ProxyTarget http://iainstitute.org
 PerlSetVar RequestBodyCache @ServerRoot@/tmp
 
 <Directory "@DocumentRoot@">
+AllowOverride all
 AddHandler cgi-script .cgi
-Options +ExecCGI
-# +MultiViews
+Options Indexes ExecCGI MultiViews
 #DirectoryIndex index
 </Directory>
