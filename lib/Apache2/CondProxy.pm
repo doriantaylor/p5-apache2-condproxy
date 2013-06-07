@@ -30,11 +30,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.03
+Version 0.04
 
 =cut
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 
 =head1 SYNOPSIS
@@ -112,7 +112,13 @@ sub do_proxy {
 
     # $r->add_input_filter(\&_resurrect_input);
 
-    $r->filename(sprintf 'proxy:%s%s', $base, $r->uri);
+    # XXX there is probably a much more robust way to do this re config
+    my $uri = $r->uri;
+    my $loc = $r->location || '/';
+    $loc =~ s!/+$!!;
+    $uri =~ s!^$loc(.*)!$1!;
+
+    $r->filename(sprintf 'proxy:%s%s', $base, $uri);
     $r->log->debug("Proxying to " . $r->filename);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     # duh, we redefine $r->handler above. I guess this isn't the best

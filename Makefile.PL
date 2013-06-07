@@ -6,6 +6,7 @@ all_from 'lib/Apache2/CondProxy.pm';
 author   q{Dorian Taylor <dorian@cpan.org>};
 license  'apache';
 
+requires 'mod_perl2';
 requires 'Path::Class';
 
 build_requires 'Test::More';
