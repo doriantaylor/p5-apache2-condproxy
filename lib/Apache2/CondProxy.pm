@@ -30,11 +30,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.04
+Version 0.05
 
 =cut
 
-our $VERSION = '0.04';
+our $VERSION = '0.05';
 
 
 =head1 SYNOPSIS
@@ -225,7 +225,7 @@ sub _trap_output {
     until ($bb->is_empty) {
         my $b = $bb->first;
         $b->remove;
-        $new_bb->insert_tail($bb);
+        $new_bb->insert_tail($b);
     }
     $bb->destroy;
 
