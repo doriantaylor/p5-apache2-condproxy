@@ -7,7 +7,7 @@ author   q{Dorian Taylor <dorian@cpan.org>};
 license  'apache';
 
 requires 'mod_perl2';
-requires 'Path::Class';
+requires 'Path::Class' => '0.24';
 
 build_requires 'Test::More';
 build_requires 'Apache::Test';

@@ -80,7 +80,20 @@ sub handler :method {
         my @enc = $hdr->get('Accept-Encoding');
         $hdr->unset('Accept-Encoding');
 
-        my $subr = $r->lookup_uri($r->uri);
+        my $subr = $r->lookup_method_uri($r->method, $r->unparsed_uri);
+        $subr->args($r->args);
+
+        # fix the request method/
+        #$subr->method($r->method);
+        #$subr->method_number($r->method_number);
+        $r->log->debug($subr->method);
+        if (my $ct = $r->headers_in->get('Content-Type')) {
+            $subr->headers_in->set('Content-Type', $ct);
+        }
+        if (my $cl = $r->headers_in->get('Content-Length')) {
+            $subr->headers_in->set('Content-Length', $cl);
+        }
+
         # we don't need to run the response handler if the response is
         # already an error
 
@@ -94,14 +107,33 @@ sub handler :method {
 
         # run the subrequest
         my $return = $subr->run;
-        #$r->log->debug($return);
+        $r->log->debug("Subrequest returned $return and status "
+                           . $subr->status);
 
         # use the RETURN VALUE from the subreq not its ->status
-        return $r->do_proxy if $r->_is_error($return);
+        # actually no, check em both
+        if ($r->_is_error($return) or $r->_is_error($subr->status)) {
+            return $r->do_proxy;
+        }
+        else {
+            my $ct = $subr->content_type;
+            $r->log->debug($subr->content_type);
+            $r->content_type($subr->content_type);
+            #$r->headers_out->et('Content-Length'
+            $r->SUPER::handler('modperl');
+            $r->set_handlers(PerlResponseHandler => sub {
+                                 my $x = shift;
+                                 $x->log->debug('Dummy response');
+                                 #$x->content_type($ct);
+                                 Apache2::Const::OK });
+        }
+    }
+    else {
+        $r->log->debug('Not running on a subrequest, ps: ' .  $r->status);
     }
 
     # shhh we weren't really here
-    Apache2::Const::DECLINED;
+    Apache2::Const::OK;
 }
 
 sub do_proxy {
@@ -182,7 +214,10 @@ sub _trap_input {
             # pull the content out of the bucket and stick it in the
             # tempfile
             my $len = $b->read(my $data);
+            $r->log->debug($data);
             $tmp->syswrite($data);
+
+            $b = APR::Bucket->new($bb->bucket_alloc, $data) if $len;
 
             # pull the bucket out of the current brigade and attach it
             # to the end of the next one
@@ -217,7 +252,7 @@ sub _trap_output {
     my $r = $f->r;
     my $c = $f->c;
 
-    $r->log->debug("derp derp " . $r->status);
+    #$r->log->debug("derp derp " . $r->status);
 
     # XXX this is a cargo cult. I have no idea if this deep-sixes the
     # output but it seems to send it twice if I don't.
@@ -227,17 +262,19 @@ sub _trap_output {
         $b->remove;
         $new_bb->insert_tail($b);
     }
-    $bb->destroy;
+    #$bb->destroy;
+    $r->log->debug('WTF: ' . $r->status);
 
     if (_is_error($r, $r->status)) {
         $r->log->debug
-            (__PACKAGE__ . ' output filter: dropping subrequest body');
+            (__PACKAGE__ . ' output filter: dropping subrequest response body');
         #$bb->destroy;
         #return Apache2::Const::OK;
         $new_bb->destroy;
     }
     else {
         $f->next->pass_brigade($new_bb);
+        return Apache2::Const::DECLINED;
     }
 
     Apache2::Const::OK;
@@ -257,7 +294,8 @@ sub _is_error {
         sprintf('Code %d from request to %s from %s line %d',
                 $code, $r->uri, $file, $line));
 
-    return ($code >= 400 && $code < 500);
+    #return ($code >= 400 && $code < 500);
+    return $code == 404;
 }
 
 =head1 AUTHOR
