@@ -7,6 +7,7 @@ use warnings FATAL => 'all';
 use Apache2::RequestRec  ();
 use Apache2::RequestUtil ();
 use Apache2::SubRequest  ();
+use Apache2::Response    ();
 use Apache2::Filter      ();
 use Apache2::Connection  ();
 use Apache2::Log         ();
@@ -16,10 +17,50 @@ use APR::Bucket          ();
 use APR::Brigade         ();
 
 use Apache2::Const -compile => qw(OK DECLINED SERVER_ERROR PROXYREQ_REVERSE);
-use APR::Const     -compile => qw(:common);
+use APR::Const     -compile => qw(:common ENOTIMPL OVERLAP_TABLES_SET);
 
-use File::Spec  ();
 use Path::Class ();
+use File::Spec  ();
+use File::Temp  ();
+
+# constants for pnotes
+use constant BRIGADE => __PACKAGE__ . '::BRIGADE';
+use constant INPUT   => __PACKAGE__ . '::INPUT';
+use constant CACHE   => __PACKAGE__ . '::CACHE';
+
+BEGIN {
+    # stopgap implementation of ap_save_brigade
+    unless (Apache2::Filter->can('save_brigade')) {
+        *Apache2::Filter::save_brigade = sub {
+            my ($f, $saveto, $bb, $pool) = @_;
+            # XXX should this be $f->r->pool?
+            $pool ||= $f->c->pool;
+
+            my $ret = APR::Const::SUCCESS;
+
+            for (my $b = $bb->first; $b && !$b->is_eos; $b = $bb->next($b)) {
+                my $rv = $b->setaside($pool);
+
+                if ($rv == APR::Const::ENOTIMPL) {
+                    my $len = $b->read(my $data);
+                    # apparently this changes the bucket type?
+                    $rv = $b->setaside($pool) if $len;
+                }
+
+                # check for some other kind of error
+                if ($rv != APR::Const::SUCCESS) {
+                    $ret = $rv;
+                    return $rv if $rv != APR::Const::ENOTIMPL;
+                }
+            }
+
+            # now concatenate the brigade to the target
+            $saveto->concat($bb);
+
+            return $ret;
+        };
+    }
+}
 
 # if i recall correctly, mod_perl doesn't like 'use base'.
 our @ISA = qw(Apache2::RequestRec);
@@ -30,12 +71,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.05
+Version 0.10
 
 =cut
 
-our $VERSION = '0.05';
-
+our $VERSION = '0.10';
 
 =head1 SYNOPSIS
 
@@ -71,268 +111,230 @@ target.
 
 =cut
 
+# XXX this probably doesn't need to be a method handler
 sub new {
     bless {}, __PACKAGE__;
 }
 
-sub handler :method {
+sub handler : method {
     my $r = ref $_[0] ? $_[0] : bless { r => $_[1] }, $_[0];
 
     if ($r->is_initial_req) {
-        # install content handler
-
-        # first get any original handlers
-        my $h = $r->SUPER::handler;
-        $r->notes->set(__PACKAGE__ . '::HANDLER', $h) if $h;
-        my @h = @ { $r->get_handlers('PerlResponseHandler') || [] };
-
-        $r->SUPER::handler('modperl');
-        $r->set_handlers(PerlResponseHandler => [\&_response_handler, @h]);
-    }
-    # shhh we weren't really here
-    Apache2::Const::OK;
-}
-
-sub _response_handler :method {
-    #my $r = $_[0]->isa(__PACKAGE__) ? $_[0] : bless { r => $_[1] }, __PACKAGE__;
-    my $r = bless { r => shift }, __PACKAGE__;
-
-    # XXX do something smarter with Accept-Encoding than removing it
-    my $hdr = $r->headers_in;
-    my @enc = $hdr->get('Accept-Encoding');
-    $hdr->unset('Accept-Encoding');
-
-    my $subr = $r->lookup_method_uri($r->method, $r->unparsed_uri);
-    #$subr->args($r->args);
-
-    # fix the request method/
-    #$subr->method($r->method);
-    #$subr->method_number($r->method_number);
-    #$r->log->debug($subr->method);
-
-    # these get lost 
-    if (my $ct = $r->headers_in->get('Content-Type')) {
-       $subr->headers_in->set('Content-Type', $ct);
-    }
-    if (my $cl = $r->headers_in->get('Content-Length')) {
-       $subr->headers_in->set('Content-Length', $cl);
-    }
-
-    # we don't need to run the response handler if the response is
-    # already an error
-
-    if ($r->_is_error($subr->status)) {
-        return $r->do_proxy;
-    }
-
-    # set up filters
-    #$subr->add_input_filter(\&_trap_input);
-    $subr->add_output_filter(\&_trap_output);
-
-    # run the subrequest
-    my $return = $subr->run;
-    $r->log->debug("Subrequest returned $return and status "
-                       . $subr->status);
-
-
-    $r->log->debug('Main request status is: ' . $r->status);
-
-    # use the RETURN VALUE from the subreq not its ->status
-    # actually no, check em both
-    if ($r->_is_error($return) or $r->_is_error($subr->status)) {
-        $r->do_proxy;
-        return Apache2::Const::DECLINED;
-    }
-
-    Apache2::Const::OK;
-}
-
-sub do_proxy {
-    my $r = shift;
-    my $base = $r->dir_config('ProxyTarget');
-    #$r->log->debug("proxying to $base");
-    # TODO: deal with potentially missing or malformed target
-
-    # $r->add_input_filter(\&_resurrect_input);
-
-    # XXX there is probably a much more robust way to do this re config
-    my $uri = $r->unparsed_uri;
-    my $loc = $r->location || '/';
-    $loc =~ s!/+$!!;
-    $uri =~ s!^$loc(.*)!$1!;
-
-    $r->filename(sprintf 'proxy:%s%s', $base, $uri);
-    $r->log->debug("Proxying to " . $r->filename);
-    $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
-    # duh, we redefine $r->handler above. I guess this isn't the best
-    # name for it.
-    $r->SUPER::handler('proxy-server');
-
-    warn $r->{r}->handler;
-
-    # TODO: resurrect request body if one is present
-
-    Apache2::Const::OK;
-}
-
-sub _trap_input {
-    my ($f, $bb, $mode, $block, $readbytes) = @_;
-    my $c = $f->c;
-    my $r = $f->r;
-
-    $r->log->debug("Trapping $readbytes of input");
-
-    my $tmp = $f->ctx;
-    unless ($tmp) {
-        # XXX this is an error unless $dir is writable
+        # make the temp directory
+        umask 077;
         my $dir = Path::Class::Dir->new
             ($r->dir_config('RequestBodyCache') || File::Spec->tmpdir);
-
-        # XXX test this
         eval { $dir->mkpath };
         if ($@) {
             $r->log->crit("Cannot make directory $dir: $@");
             return Apache2::Const::SERVER_ERROR;
         }
 
-        ($tmp, my $fn) = $dir->tempfile(OPEN => 1);
-        $r->log->debug("Opening $tmp");
-        unless ($tmp) {
-            $r->log->crit("Cannot open temporary file $tmp");
-            return Apache2::Const::SERVER_ERROR;
+        $r->pnotes(CACHE, $dir);
+
+        my $uri = $r->unparsed_uri;
+        $r->log->debug("Attempting lookup on $uri");
+        my $subr = $r->lookup_method_uri($r->method, $uri);
+        if ($subr->status == 404) {
+            $r->log->debug('Proxying before subrequest is run');
+            return _do_proxy($r);
         }
-        $f->ctx($tmp);
+
+        $r->log->debug('Results inconclusive; running subrequest');
+        $subr->add_input_filter(\&_input_filter_tee);
+        $subr->add_output_filter(\&_output_filter_hold);
+        my $rv = $subr->run;
+
+        # we only care about 404
+        if ($rv == 404 or $subr->status == 404) {
+            $r->log->debug('Proxying after subrequest is run');
+            return _do_proxy($r);
+        }
+        else {
+            $r->log->debug
+                ("Subrequest did not return 404; serving content for $uri");
+
+            # copy headers from subreq
+            $r->headers_out->overlap
+                ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
+            $r->err_headers_out->overlap
+                ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
+
+            # apparently content_type has to be done separately
+            $r->log->debug($subr->content_type);
+            $r->content_type($subr->content_type);
+            $r->content_encoding($subr->content_encoding)
+                if $subr->content_encoding;
+            $r->set_last_modified($subr->mtime) if $subr->mtime;
+
+            $r->SUPER::handler('modperl');
+            $r->set_handlers(PerlResponseHandler => \&_response_handler);
+            $r->push_handlers(PerlCleanupHandler => \&_cleanup_handler);
+            $r->add_output_filter(\&_output_filter_release);
+        }
     }
 
-    # create a new brigade
-    my $bb_ctx = APR::Brigade->new($c->pool, $c->bucket_alloc);
-    my $rv = $f->next->get_brigade($bb_ctx, $mode, $block, $readbytes);
+    Apache2::Const::OK;
+}
+
+sub _do_proxy {
+    my $r = shift;
+
+    my $base = $r->dir_config('ProxyTarget');
+    my $uri = $r->unparsed_uri;
+    # XXX this will contain content from Files, LocationMatch, etc.
+    my $loc = $r->location || '/';
+    $loc =~ s!/+$!!;
+    $uri =~ s!^$loc(.*)!$1!;
+
+    $r->filename(sprintf 'proxy:%s%s', $base, $uri);
+    $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
+    $r->SUPER::handler('proxy-server');
+    $r->add_input_filter(\&_input_filter_replay);
+
+    return Apache2::Const::OK;
+}
+
+sub _response_handler {
+    my $r = shift;
+    #$r->log->debug('lol response handler');
+    Apache2::Const::OK;
+}
+
+sub _cleanup_handler {
+    my $r = shift;
+    if (my $xx = $r->pnotes(INPUT)) {
+        $r->log->debug
+            ('Unlinking temporary file in case it is still sticking around');
+        unlink($xx->[0]);
+    }
+    Apache2::Const::OK;
+}
+
+sub _input_filter_tee {
+    my ($f, $bb, $mode, $block, $readbytes) = @_;
+    my $c = $f->c;
+    my $r = $f->r;
+
+    $r->log->debug('Pre-emptively storing request input');
+
+    # 
+    my $in = APR::Brigade->new($c->pool, $c->bucket_alloc);
+    my $rv = $f->next->get_brigade($in, $mode, $block, $readbytes);
     return $rv unless $rv == APR::Const::SUCCESS;
 
-    # tee all request input into a temporary file
+    # only open the tempfile if there is something to put in it
+    unless ($in->is_empty) {
 
-    unless ($bb_ctx->is_empty) {
-        # store the tempfile
-
-        while (!$bb_ctx->is_empty) {
-            my $b = $bb_ctx->first;
-
-            $b->remove;
-            if ($b->is_eos) {
-                $bb->insert_tail($b);
-                $tmp->close;
-                last;
+        # deal with tempfile
+        my $fh;
+        my $xx = $r->main->pnotes(INPUT);
+        if ($xx) {
+            $fh = $xx->[1];
+        }
+        else {
+            # unfortunately something does not like the preemptive unlink
+            my $dir = $r->main->pnotes(CACHE);
+            my $fn;
+            eval { ($fh, $fn) = $dir->tempfile(OPEN => 1, UNLINK => 0) };
+            if ($@) {
+                $r->log->crit("Could not create temporary file in $dir: $@");
+                return Apache2::Const::SERVER_ERROR;
             }
 
-            # pull the content out of the bucket and stick it in the
-            # tempfile
-            my $len = $b->read(my $data);
-            $r->log->debug($data);
-            $tmp->syswrite($data);
+            $fh->binmode;
+            # also yes I know this is the reverse of what File::Temp returns
+            $r->main->pnotes(INPUT, [$fn, $fh]);
+        }
 
-            $b = APR::Bucket->new($bb->bucket_alloc, $data) if $len;
-
-            # pull the bucket out of the current brigade and attach it
-            # to the end of the next one
-            #$b->remove;
-            $bb->insert_tail($b);
+        for (my $b = $in->first; $b; $b = $in->next($b)) {
+            if ($b->is_eos) {
+                # flush the temp file and seek it to zero
+                $fh->flush;
+                $fh->seek(0, 0);
+            }
+            elsif (my $len = $b->read(my $data)) {
+                $fh->write($data);
+            }
+            else {
+                # noop?
+            }
         }
     }
 
-    Apache2::Const::OK;
+    $bb->concat($in);
+
+    APR::Const::SUCCESS;
 }
 
-# read the cached input back into the input stream
-
-sub _resurrect_input {
+# it kinda sucks there's no way to make file buckets in mod_perl
+# because this would probably be way more efficient to stick the fd in
+# a bucket than read the file out in perl.
+sub _input_filter_replay {
     my ($f, $bb, $mode, $block, $readbytes) = @_;
-    my $r = $f->r;
-
-    $r->log->debug('running resurrect input filter');
-
-    #my $c = $f->c;
-    #my $bb_ctx = APR::Brigade->new($c->pool, $c->bucket_alloc);
-    #my $rv = $f->next->get_brigade($bb_ctx, $mode, $block, $readbytes);
-    #return $rv unless $rv == APR::Const::SUCCESS;
-
-    # pull the contents out of the file and stick it back in the brigade
-
-    Apache2::Const::OK;
-}
-
-sub _trap_output {
-    my ($f, $bb) = @_;
-    my $r = $f->r;
     my $c = $f->c;
+    my $r = $f->r;
 
-    $bb->destroy;
-    return Apache2::Const::OK;
+    my $xx = $r->pnotes(INPUT) or return Apache2::Const::DECLINED;
+    my ($fn, $fh) = @$xx;
 
-    my $seen = $f->ctx or $f->ctx(1);
+    $r->log->debug('Replaying input into proxy request');
 
-    # internal redirect? what gives?
-    if ($r->prev) {
-        $r->log->debug('what about ' . $r->prev->status);
-    }
+    # XXX do i even have to do this?
+    my $in = APR::Brigade->new($c->pool, $c->bucket_alloc);
+    my $rv = $f->next->get_brigade($in, $mode, $block, $readbytes);
+    return $rv unless $rv == APR::Const::SUCCESS;
 
-    # XXX this is a cargo cult. I have no idea if this deep-sixes the
-    # output but it seems to send it twice if I don't.
+    # whatever is in it, empty it
+    $in->destroy;
 
-    # YYY ok i know why now, it's because it was actually *invoking*
-    # the handler twice, once in the subrequest and once by the main
-    # request when the fixup handler exited. this of course didn't
-    # happen when the request was proxied, but it 
-
-    # if ($bb->is_empty or (!$seen && $bb->first->is_eos)) {
-    #     $r->log->debug('Brigade is empty');
-    #     #$bb->destroy;
-    #     return Apache2::Const::DECLINED;
-    # }
-
-    my $new_bb = APR::Brigade->new($c->pool, $c->bucket_alloc);
-    until ($bb->is_empty) {
-        my $b = $bb->first;
-        my $data = '';
-        $b->read($data);
-        $r->log->debug($data) if length $data;
-        $r->log->debug('seen EOS') if $b->is_eos;
-        $b->remove;
-        $new_bb->insert_tail($b);
-    }
-    $bb->destroy;
-    $r->log->debug('WTF: ' . $r->status . ' ' . $r->filename);
-
-    if (_is_error($r, $r->status)) {
+    # get the data out of the file
+    my $len = $fh->read(my $data, $readbytes);
+    if ($len) {
         $r->log->debug
-            (__PACKAGE__ . ' output filter: dropping subrequest response body');
-        #$bb->destroy;
-        #return Apache2::Const::OK;
-        $new_bb->destroy;
+            ("Replaying $len bytes from $fn (Block size: $readbytes)");
+        my $b = APR::Bucket->new($c->bucket_alloc, $data);
+        $bb->insert_tail($b);
+        # eos if there's nothing left to read, flush otherwise
+        if ($fh->eof) {
+            $r->log->debug('End of file, appending EOS bucket');
+            $bb->insert_tail(APR::Bucket::eos_create($c->bucket_alloc));
+            unlink($fn);
+        }
+        else {
+            $bb->insert_tail(APR::Bucket::flush_create($c->bucket_alloc));
+        }
     }
     else {
-        $f->next->pass_brigade($new_bb);
-        #return Apache2::Const::DECLINED;
+        $r->log->debug('Empty file or end, appending EOS bucket');
+        $bb->insert_tail(APR::Bucket::eos_create($c->bucket_alloc));
+        unlink($fn);
     }
 
-    Apache2::Const::OK;
+    APR::Const::SUCCESS;
 }
 
-# what our configuration considers an error
-sub _is_error {
-    my ($r, $code) = @_;
-    unless ($code) {
-        $r->log->debug(sprintf 'Setting null code to %d', $r->status);
-        $code = $r->status;
+sub _output_filter_hold {
+    my ($f, $bb) = @_;
+    my $c = $f->c;
+    my $r = $f->r;
+
+    my $saveto = $r->main->pnotes(BRIGADE);
+    unless ($saveto) {
+        $saveto = APR::Brigade->new($c->pool, $c->bucket_alloc);
+        $r->main->pnotes(BRIGADE, $saveto);
     }
 
-    my ($pkg, $file, $line) = caller;
+    return $f->save_brigade($saveto, $bb, $c->pool);
+}
 
-    $r->log->debug(
-        sprintf('Code %d from request to %s from %s line %d',
-                $code, $r->uri, $file, $line));
+sub _output_filter_release {
+    my ($f, $bb) = @_;
+    my $r = $f->r;
 
-    #return ($code >= 400 && $code < 500);
-    return $code == 404;
+    $bb = $r->pnotes(BRIGADE) or return Apache2::Const::DECLINED;
+
+    return $f->next->pass_brigade($bb);
 }
 
 =head1 AUTHOR
@@ -341,7 +343,7 @@ Dorian Taylor, C<< <dorian at cpan.org> >>
 
 =head1 BUGS
 
-Please report any bugs or feature requests to C<bug-apache2-condproxy
+Please report any bugs or feature requests to C<bug-apache2-filterfun
 at rt.cpan.org>, or through the web interface at
 L<http://rt.cpan.org/NoAuth/ReportBug.html?Queue=Apache2-CondProxy>.
 I will be notified, and then you'll automatically be notified of
@@ -352,6 +354,7 @@ progress on your bug as I make changes.
 You can find documentation for this module with the perldoc command.
 
     perldoc Apache2::CondProxy
+
 
 You can also look for information at:
 
@@ -377,19 +380,18 @@ L<http://search.cpan.org/dist/Apache2-CondProxy/>
 
 =head1 LICENSE AND COPYRIGHT
 
-Copyright 2012 Dorian Taylor.
+Copyright 2013 Dorian Taylor.
 
 Licensed under the Apache License, Version 2.0 (the "License"); you
 may not use this file except in compliance with the License.  You may
 obtain a copy of the License at
-L<http://www.apache.org/licenses/LICENSE-2.0>
+L<http://www.apache.org/licenses/LICENSE-2.0> .
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 implied.  See the License for the specific language governing
 permissions and limitations under the License.
-
 
 =cut
 
