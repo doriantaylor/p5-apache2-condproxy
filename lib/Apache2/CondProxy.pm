@@ -71,81 +71,92 @@ target.
 
 =cut
 
+sub new {
+    bless {}, __PACKAGE__;
+}
+
 sub handler :method {
     my $r = ref $_[0] ? $_[0] : bless { r => $_[1] }, $_[0];
 
     if ($r->is_initial_req) {
-        # XXX do something smarter with Accept-Encoding than removing it
-        my $hdr = $r->headers_in;
-        my @enc = $hdr->get('Accept-Encoding');
-        $hdr->unset('Accept-Encoding');
+        # install content handler
 
-        my $subr = $r->lookup_method_uri($r->method, $r->unparsed_uri);
-        $subr->args($r->args);
+        # first get any original handlers
+        my $h = $r->SUPER::handler;
+        $r->notes->set(__PACKAGE__ . '::HANDLER', $h) if $h;
+        my @h = @ { $r->get_handlers('PerlResponseHandler') || [] };
 
-        # fix the request method/
-        #$subr->method($r->method);
-        #$subr->method_number($r->method_number);
-        $r->log->debug($subr->method);
-        if (my $ct = $r->headers_in->get('Content-Type')) {
-            $subr->headers_in->set('Content-Type', $ct);
-        }
-        if (my $cl = $r->headers_in->get('Content-Length')) {
-            $subr->headers_in->set('Content-Length', $cl);
-        }
-
-        # we don't need to run the response handler if the response is
-        # already an error
-
-        if ($r->_is_error($subr->status)) {
-            return $r->do_proxy;
-        }
-
-        # set up filters
-        #$subr->add_input_filter(\&_trap_input);
-        $subr->add_output_filter(\&_trap_output);
-
-        # run the subrequest
-        my $return = $subr->run;
-        $r->log->debug("Subrequest returned $return and status "
-                           . $subr->status);
-
-        # use the RETURN VALUE from the subreq not its ->status
-        # actually no, check em both
-        if ($r->_is_error($return) or $r->_is_error($subr->status)) {
-            return $r->do_proxy;
-        }
-        else {
-            my $ct = $subr->content_type;
-            $r->log->debug($subr->content_type);
-            $r->content_type($subr->content_type);
-            #$r->headers_out->et('Content-Length'
-            $r->SUPER::handler('modperl');
-            $r->set_handlers(PerlResponseHandler => sub {
-                                 my $x = shift;
-                                 $x->log->debug('Dummy response');
-                                 #$x->content_type($ct);
-                                 Apache2::Const::OK });
-        }
+        $r->SUPER::handler('modperl');
+        $r->set_handlers(PerlResponseHandler => [\&_response_handler, @h]);
     }
-    else {
-        $r->log->debug('Not running on a subrequest, ps: ' .  $r->status);
-    }
-
     # shhh we weren't really here
+    Apache2::Const::OK;
+}
+
+sub _response_handler :method {
+    #my $r = $_[0]->isa(__PACKAGE__) ? $_[0] : bless { r => $_[1] }, __PACKAGE__;
+    my $r = bless { r => shift }, __PACKAGE__;
+
+    # XXX do something smarter with Accept-Encoding than removing it
+    my $hdr = $r->headers_in;
+    my @enc = $hdr->get('Accept-Encoding');
+    $hdr->unset('Accept-Encoding');
+
+    my $subr = $r->lookup_method_uri($r->method, $r->unparsed_uri);
+    #$subr->args($r->args);
+
+    # fix the request method/
+    #$subr->method($r->method);
+    #$subr->method_number($r->method_number);
+    #$r->log->debug($subr->method);
+
+    # these get lost 
+    if (my $ct = $r->headers_in->get('Content-Type')) {
+       $subr->headers_in->set('Content-Type', $ct);
+    }
+    if (my $cl = $r->headers_in->get('Content-Length')) {
+       $subr->headers_in->set('Content-Length', $cl);
+    }
+
+    # we don't need to run the response handler if the response is
+    # already an error
+
+    if ($r->_is_error($subr->status)) {
+        return $r->do_proxy;
+    }
+
+    # set up filters
+    #$subr->add_input_filter(\&_trap_input);
+    $subr->add_output_filter(\&_trap_output);
+
+    # run the subrequest
+    my $return = $subr->run;
+    $r->log->debug("Subrequest returned $return and status "
+                       . $subr->status);
+
+
+    $r->log->debug('Main request status is: ' . $r->status);
+
+    # use the RETURN VALUE from the subreq not its ->status
+    # actually no, check em both
+    if ($r->_is_error($return) or $r->_is_error($subr->status)) {
+        $r->do_proxy;
+        return Apache2::Const::DECLINED;
+    }
+
     Apache2::Const::OK;
 }
 
 sub do_proxy {
     my $r = shift;
     my $base = $r->dir_config('ProxyTarget');
-    $r->log->debug("proxying to $base");
+    #$r->log->debug("proxying to $base");
     # TODO: deal with potentially missing or malformed target
 
     # $r->add_input_filter(\&_resurrect_input);
 
     # XXX there is probably a much more robust way to do this re config
-    my $uri = $r->uri;
+    my $uri = $r->unparsed_uri;
     my $loc = $r->location || '/';
     $loc =~ s!/+$!!;
     $uri =~ s!^$loc(.*)!$1!;
@@ -156,6 +167,8 @@ sub do_proxy {
     # duh, we redefine $r->handler above. I guess this isn't the best
     # name for it.
     $r->SUPER::handler('proxy-server');
+
+    warn $r->{r}->handler;
 
     # TODO: resurrect request body if one is present
 
@@ -252,18 +265,42 @@ sub _trap_output {
     my $r = $f->r;
     my $c = $f->c;
 
-    #$r->log->debug("derp derp " . $r->status);
+    $bb->destroy;
+    return Apache2::Const::OK;
+
+    my $seen = $f->ctx or $f->ctx(1);
+
+    # internal redirect? what gives?
+    if ($r->prev) {
+        $r->log->debug('what about ' . $r->prev->status);
+    }
 
     # XXX this is a cargo cult. I have no idea if this deep-sixes the
     # output but it seems to send it twice if I don't.
+
+    # YYY ok i know why now, it's because it was actually *invoking*
+    # the handler twice, once in the subrequest and once by the main
+    # request when the fixup handler exited. this of course didn't
+    # happen when the request was proxied, but it 
+
+    # if ($bb->is_empty or (!$seen && $bb->first->is_eos)) {
+    #     $r->log->debug('Brigade is empty');
+    #     #$bb->destroy;
+    #     return Apache2::Const::DECLINED;
+    # }
+
     my $new_bb = APR::Brigade->new($c->pool, $c->bucket_alloc);
     until ($bb->is_empty) {
         my $b = $bb->first;
+        my $data = '';
+        $b->read($data);
+        $r->log->debug($data) if length $data;
+        $r->log->debug('seen EOS') if $b->is_eos;
         $b->remove;
         $new_bb->insert_tail($b);
     }
-    #$bb->destroy;
-    $r->log->debug('WTF: ' . $r->status);
+    $bb->destroy;
+    $r->log->debug('WTF: ' . $r->status . ' ' . $r->filename);
 
     if (_is_error($r, $r->status)) {
         $r->log->debug
@@ -274,7 +311,7 @@ sub _trap_output {
     }
     else {
         $f->next->pass_brigade($new_bb);
-        return Apache2::Const::DECLINED;
+        #return Apache2::Const::DECLINED;
     }
 
     Apache2::Const::OK;
