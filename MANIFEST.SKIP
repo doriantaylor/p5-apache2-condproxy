@@ -12,3 +12,4 @@ valgrind.sh
 ^t/conf/.*\.p[lm]$
 ^t/conf/mime\.types$
 ^t/logs
+^MYMETA.*

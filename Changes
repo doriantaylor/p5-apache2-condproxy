@@ -1,5 +1,8 @@
 Revision history for Apache2-CondProxy
 
+0.11    Thu Jan  2 15:13:33 PST 2014
+        Fixed aberrant MANIFEST, moved Apache::Test to configure_requires
+
 0.01    Fri Aug 24 23:03:10 PDT 2012
         Initial prototype, packaged for CPAN
 

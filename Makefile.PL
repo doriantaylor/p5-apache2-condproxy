@@ -9,8 +9,8 @@ license  'apache';
 requires 'mod_perl2';
 requires 'Path::Class' => '0.24';
 
-build_requires 'Test::More';
-build_requires 'Apache::Test';
+build_requires     'Test::More';
+configure_requires 'Apache::Test';
 
 clean_files 't/TEST t/SMOKE';
 
