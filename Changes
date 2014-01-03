@@ -1,5 +1,8 @@
 Revision history for Apache2-CondProxy
 
+0.13    Thu Jan  2 21:57:04 PST 2014
+        Added URI scheme matching, Location header rewriting
+
 0.12    Thu Jan  2 19:29:31 PST 2014
         Fixed misbehaving subrequest input filter
 

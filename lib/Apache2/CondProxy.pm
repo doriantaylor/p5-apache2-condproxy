@@ -6,11 +6,13 @@ use warnings FATAL => 'all';
 
 use Apache2::RequestRec  ();
 use Apache2::RequestUtil ();
+use Apache2::ServerRec   ();
 use Apache2::SubRequest  ();
 use Apache2::Response    ();
 use Apache2::Filter      ();
 use Apache2::Connection  ();
 use Apache2::Log         ();
+use Apache2::ModSSL      ();
 
 use APR::Table           ();
 use APR::Bucket          ();
@@ -22,6 +24,8 @@ use APR::Const     -compile => qw(:common ENOTIMPL OVERLAP_TABLES_SET);
 use Path::Class ();
 use File::Spec  ();
 use File::Temp  ();
+use URI         ();
+use URI::Escape ();
 
 # constants for pnotes
 use constant BRIGADE => __PACKAGE__ . '::BRIGADE';
@@ -71,11 +75,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.12
+Version 0.13
 
 =cut
 
-our $VERSION = '0.12';
+our $VERSION = '0.13';
 
 =head1 SYNOPSIS
 
@@ -105,9 +109,15 @@ makes the above configuration not do what we imagine it would.
 
 This module works by running the request all the way through in a
 subrequest. Before doing so, a filter is installed to trap the
-subrequest's response. If the response is I<unsuccessful>, the filter
-disposes of the error body, and the request is forwarded to the proxy
-target.
+subrequest's response. If the response is I<unsuccessful>,
+specifically if it is a C<403> or C<404>, the filter disposes of the
+error body, and the request is forwarded to the proxy target. The
+proxy URI scheme is matched to the original request URI scheme, so
+make sure you have C<SSLProxyEngine on>.
+
+If a proxy response contains a C<Location> header, and its host is the
+same as the proxy target, that header will be rewritten to point to
+the source host.
 
 =cut
 
@@ -142,6 +152,11 @@ sub handler : method {
         my $cl = $r->headers_in->get('Content-Length');
         $subr->headers_in->set('Content-Length', $cl) if $cl;
 
+        # remove Accept-Encoding header for proxy
+        my $ae = $r->headers_in->get('Accept-Encoding');
+        $r->headers_in->unset('Accept-Encoding');
+        $subr->headers_in->unset('Accept-Encoding');
+
         if ($subr->status == 404) {
             $r->log->debug('Proxying before subrequest is run');
             return _do_proxy($r);
@@ -154,23 +169,28 @@ sub handler : method {
         my $rv = $subr->run;
 
         # we only care about 404
-        if ($rv == 404 or $subr->status == 404) {
-            $r->log->debug('Proxying after subrequest is run');
+        my $st = $subr->status;
+        if (grep { $rv == $_ || $st == $_ } (403, 404)) {
+            $r->log->debug("Proxying $uri after subrequest is run");
             return _do_proxy($r);
         }
         else {
-            $r->log->debug
-                ("Subrequest did not return 404; serving content for $uri");
-
             # override the subrequest status
             $subr->status($rv) if $subr->status != $rv && $rv != 0;
             $r->status($subr->status);
 
+            # replace Accept-Encoding header
+            $r->headers_in->set('Accept-Encoding', $ae) if $ae;
+
+            $r->log->debug(
+                sprintf 'Subrequest returned %d; serving content for %s',
+                $subr->status, $uri);
+
             # copy headers from subreq
-            $r->err_headers_out->overlap
-                ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
             $r->headers_out->overlap
                 ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
+            $r->err_headers_out->overlap
+                ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
 
             # apparently content_type has to be done separately
             $r->log->debug($subr->content_type);
@@ -191,9 +211,13 @@ sub handler : method {
 
 sub _do_proxy {
     my $r = shift;
+    my $c = $r->connection;
 
-    my $base = $r->dir_config('ProxyTarget');
-    my $uri = $r->unparsed_uri;
+    my $base = URI->new($r->dir_config('ProxyTarget'));
+    # make the scheme match the request
+    $c->is_https ? $base->scheme('https') : $base->scheme('http');
+    # for some reason this started double-escaping URIs
+    my $uri = URI::Escape::uri_unescape($r->unparsed_uri);
     # XXX this will contain content from Files, LocationMatch, etc.
     my $loc = $r->location || '/';
     $loc =~ s!/+$!!;
@@ -203,8 +227,47 @@ sub _do_proxy {
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     $r->SUPER::handler('proxy-server');
     $r->add_input_filter(\&_input_filter_replay);
+    $r->add_output_filter(\&_output_filter_fix_location);
 
     return Apache2::Const::OK;
+}
+
+sub _output_filter_fix_location {
+    my ($f, $bb) = @_;
+    my $c = $f->c;
+    my $r = $f->r;
+
+    my $mainr = $r->main || $r;
+    unless ($f->ctx) {
+        my $loc  = $r->headers_out->get('Location');
+        if ($loc) {
+            # get the hostname of the request
+            my $host = $r->headers_in->get('Host')
+                || $r->server->server_hostname;
+            $host = ($c->is_https ? 'https://' : 'http://') . $host;
+            $host = URI->new($host)->canonical;
+
+            # get the proxy base
+            my $base = URI->new($r->dir_config('ProxyTarget'));
+            $c->is_https ? $base->scheme('https') : $base->scheme('http');
+
+            # fix for malformed Location header
+            $loc = URI->new_abs($loc, $base);
+            $loc = $loc->canonical;
+
+            $r->log->debug(sprintf 'Location is %s', $loc->authority);
+
+            if ($loc->authority eq $base->authority) {
+                $r->log->debug
+                    ('Setting Location authority to %s', $host->authority);
+                $loc->authority($host->authority);
+                $r->headers_out->set(Location => $loc->as_string);
+            }
+        }
+        $f->ctx(1);
+    }
+
+    Apache2::Const::DECLINED;
 }
 
 sub _response_handler {
