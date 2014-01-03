@@ -75,11 +75,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.13
+Version 0.14
 
 =cut
 
-our $VERSION = '0.13';
+our $VERSION = '0.14';
 
 =head1 SYNOPSIS
 
@@ -217,13 +217,19 @@ sub _do_proxy {
     # make the scheme match the request
     $c->is_https ? $base->scheme('https') : $base->scheme('http');
     # for some reason this started double-escaping URIs
-    my $uri = URI::Escape::uri_unescape($r->unparsed_uri);
+    #my $uri = URI::Escape::uri_unescape($r->unparsed_uri);
     # XXX this will contain content from Files, LocationMatch, etc.
-    my $loc = $r->location || '/';
-    $loc =~ s!/+$!!;
-    $uri =~ s!^$loc(.*)!$1!;
+    #my $loc = $r->location || '/';
+    #$loc =~ s!/+$!!;
+    #$uri =~ s!^$loc(.*)!$1!;
 
-    $r->filename(sprintf 'proxy:%s%s', $base, $uri);
+    # just do this.
+    $base->path_query($r->unparsed_uri);
+    # AHA: MAGIC.
+    $r->notes->set('proxy-nocanon', 1);
+
+    #$r->filename(sprintf 'proxy:%s%s', $base, $uri);
+    $r->filename(sprintf 'proxy:%s', $base);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     $r->SUPER::handler('proxy-server');
     $r->add_input_filter(\&_input_filter_replay);
