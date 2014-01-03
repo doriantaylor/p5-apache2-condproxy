@@ -1,5 +1,8 @@
 Revision history for Apache2-CondProxy
 
+0.12    Thu Jan  2 19:29:31 PST 2014
+        Fixed misbehaving subrequest input filter
+
 0.11    Thu Jan  2 15:13:33 PST 2014
         Fixed aberrant MANIFEST, moved Apache::Test to configure_requires
 

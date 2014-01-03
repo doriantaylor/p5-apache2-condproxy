@@ -71,11 +71,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.11
+Version 0.12
 
 =cut
 
-our $VERSION = '0.11';
+our $VERSION = '0.12';
 
 =head1 SYNOPSIS
 
@@ -135,12 +135,20 @@ sub handler : method {
         my $uri = $r->unparsed_uri;
         $r->log->debug("Attempting lookup on $uri");
         my $subr = $r->lookup_method_uri($r->method, $uri);
+
+        # set the content-type and content-length in the subrequest
+        my $ct = $r->headers_in->get('Content-Type');
+        $subr->headers_in->set('Content-Type', $ct) if $ct;
+        my $cl = $r->headers_in->get('Content-Length');
+        $subr->headers_in->set('Content-Length', $cl) if $cl;
+
         if ($subr->status == 404) {
             $r->log->debug('Proxying before subrequest is run');
             return _do_proxy($r);
         }
 
-        $r->log->debug('Results inconclusive; running subrequest');
+        $r->log->debug(sprintf 'Results inconclusive: %d; running subrequest',
+                       $subr->status);
         $subr->add_input_filter(\&_input_filter_tee);
         $subr->add_output_filter(\&_output_filter_hold);
         my $rv = $subr->run;
@@ -154,15 +162,19 @@ sub handler : method {
             $r->log->debug
                 ("Subrequest did not return 404; serving content for $uri");
 
+            # override the subrequest status
+            $subr->status($rv) if $subr->status != $rv && $rv != 0;
+            $r->status($subr->status);
+
             # copy headers from subreq
-            $r->headers_out->overlap
-                ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
             $r->err_headers_out->overlap
                 ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
+            $r->headers_out->overlap
+                ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
 
             # apparently content_type has to be done separately
             $r->log->debug($subr->content_type);
-            $r->content_type($subr->content_type);
+            $r->content_type($subr->content_type) if $subr->content_type;
             $r->content_encoding($subr->content_encoding)
                 if $subr->content_encoding;
             $r->set_last_modified($subr->mtime) if $subr->mtime;
@@ -216,9 +228,10 @@ sub _input_filter_tee {
     my $c = $f->c;
     my $r = $f->r;
 
+    my $mainr = $r->main || $r;
+
     $r->log->debug('Pre-emptively storing request input');
 
-    # 
     my $in = APR::Brigade->new($c->pool, $c->bucket_alloc);
     my $rv = $f->next->get_brigade($in, $mode, $block, $readbytes);
     return $rv unless $rv == APR::Const::SUCCESS;
@@ -228,13 +241,13 @@ sub _input_filter_tee {
 
         # deal with tempfile
         my $fh;
-        my $xx = $r->main->pnotes(INPUT);
+        my $xx = $mainr->pnotes(INPUT);
         if ($xx) {
             $fh = $xx->[1];
         }
         else {
             # unfortunately something does not like the preemptive unlink
-            my $dir = $r->main->pnotes(CACHE);
+            my $dir = $mainr->pnotes(CACHE);
             my $fn;
             eval { ($fh, $fn) = $dir->tempfile(OPEN => 1, UNLINK => 0) };
             if ($@) {
@@ -244,7 +257,7 @@ sub _input_filter_tee {
 
             $fh->binmode;
             # also yes I know this is the reverse of what File::Temp returns
-            $r->main->pnotes(INPUT, [$fn, $fh]);
+            $mainr->pnotes(INPUT, [$fn, $fh]);
         }
 
         for (my $b = $in->first; $b; $b = $in->next($b)) {
@@ -319,10 +332,12 @@ sub _output_filter_hold {
     my $c = $f->c;
     my $r = $f->r;
 
-    my $saveto = $r->main->pnotes(BRIGADE);
+    my $mainr = $r->main || $r;
+
+    my $saveto = $mainr->pnotes(BRIGADE);
     unless ($saveto) {
         $saveto = APR::Brigade->new($c->pool, $c->bucket_alloc);
-        $r->main->pnotes(BRIGADE, $saveto);
+        $mainr->pnotes(BRIGADE, $saveto);
     }
 
     return $f->save_brigade($saveto, $bb, $c->pool);
@@ -333,6 +348,7 @@ sub _output_filter_release {
     my $r = $f->r;
 
     $bb = $r->pnotes(BRIGADE) or return Apache2::Const::DECLINED;
+    return Apache2::Const::DECLINED unless $bb->length;
 
     return $f->next->pass_brigade($bb);
 }
