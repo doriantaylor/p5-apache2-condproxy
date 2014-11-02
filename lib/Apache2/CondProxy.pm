@@ -32,8 +32,11 @@ use constant BRIGADE => __PACKAGE__ . '::BRIGADE';
 use constant INPUT   => __PACKAGE__ . '::INPUT';
 use constant CACHE   => __PACKAGE__ . '::CACHE';
 
+my $TRUE = qr/^\s*(1|true|on|yes)\s*$/i;
+
 BEGIN {
-    # stopgap implementation of ap_save_brigade
+    # Stopgap implementation of ap_save_brigade. This is almost
+    # exactly what the C version looks like in server/util_filter.c.
     unless (Apache2::Filter->can('save_brigade')) {
         *Apache2::Filter::save_brigade = sub {
             my ($f, $saveto, $bb, $pool) = @_;
@@ -75,11 +78,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.14
+Version 0.16
 
 =cut
 
-our $VERSION = '0.14';
+our $VERSION = '0.16';
 
 =head1 SYNOPSIS
 
@@ -87,6 +90,7 @@ our $VERSION = '0.14';
     PerlFixupHandler Apache2::CondProxy
     PerlSetVar ProxyTarget http://another.host/
     PerlSetVar RequestBodyCache /tmp
+    PerlSetVar MatchScheme on
 
 =head1 DESCRIPTION
 
@@ -119,6 +123,42 @@ If a proxy response contains a C<Location> header, and its host is the
 same as the proxy target, that header will be rewritten to point to
 the source host.
 
+=head1 DIRECTIVES
+
+Configuration directives are currently carried out using
+C<PerlSetVar>. Yep, I know. Consider them I<provisional>. You will
+almost certainly need to reconfigure this module with proper Apache
+directives by the time I get to 0.20.
+
+=head2 ProxyTarget
+
+    ProxyTarget http://some.other.site/
+
+This is the prefix of the location where requests go when they can't
+be served by the site where the request was originated. Note the path
+of the original request is appended I<relative> to the path of this
+URI, as if its initial C</> was pruned off, so craft this URI
+accordingly.
+
+=head2 RequestBodyCache
+
+    RequestBodyCache /tmp/cond-proxy
+
+In order to work with request content (e.g. C<POST>, C<PUT>), we have
+to stash it somewhere so we can replay it into the pipe. This means
+the contents of this directory are potentially sensitive. So if you're
+going to put it in C</tmp>, make sure to at least make it only
+readable to the server. Or you can have this module do that
+automatically, just make sure it can write to the parent.
+
+=head2 MatchScheme
+
+    MatchScheme on
+
+This will cause the URI scheme in proxy requests (and C<Location>
+headers from proxied responses) to match that of the originating
+request, be it C<http> or C<https>.
+
 =cut
 
 # XXX this probably doesn't need to be a method handler
@@ -131,10 +171,11 @@ sub handler : method {
 
     if ($r->is_initial_req) {
         # make the temp directory
-        umask 077;
+        # apparently umask has no effect on mkpath
+        # umask 077;
         my $dir = Path::Class::Dir->new
             ($r->dir_config('RequestBodyCache') || File::Spec->tmpdir);
-        eval { $dir->mkpath };
+        eval { $dir->mkpath(0, 0700) };
         if ($@) {
             $r->log->crit("Cannot make directory $dir: $@");
             return Apache2::Const::SERVER_ERROR;
@@ -213,22 +254,19 @@ sub _do_proxy {
     my $r = shift;
     my $c = $r->connection;
 
-    my $base = URI->new($r->dir_config('ProxyTarget'));
-    # make the scheme match the request
-    $c->is_https ? $base->scheme('https') : $base->scheme('http');
-    # for some reason this started double-escaping URIs
-    #my $uri = URI::Escape::uri_unescape($r->unparsed_uri);
-    # XXX this will contain content from Files, LocationMatch, etc.
-    #my $loc = $r->location || '/';
-    #$loc =~ s!/+$!!;
-    #$uri =~ s!^$loc(.*)!$1!;
+    my $base  = URI->new($r->dir_config('ProxyTarget'))->canonical;
+    my $match = $r->dir_config('MatchScheme') || '';
+    $match = scalar($match =~ $TRUE);
+    if ($match) {
+        $c->is_https ? $base->scheme('https') : $base->scheme('http');
+    }
 
     # just do this.
-    $base->path_query($r->unparsed_uri);
-    # AHA: MAGIC.
+    $base = URI->new_abs(substr($r->unparsed_uri, 1), $base);
+    # for some reason mod_proxy mysteriously started double-escaping
+    # URIs. AHA: MAGIC.
     $r->notes->set('proxy-nocanon', 1);
 
-    #$r->filename(sprintf 'proxy:%s%s', $base, $uri);
     $r->filename(sprintf 'proxy:%s', $base);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     $r->SUPER::handler('proxy-server');
@@ -238,36 +276,53 @@ sub _do_proxy {
     return Apache2::Const::OK;
 }
 
+
+# XXX this is the only way I could think of to get at the Location
+# header after mod_proxy took over. Could be problematic if another
+# filter in the stack flushes output before this one gets run.
 sub _output_filter_fix_location {
     my ($f, $bb) = @_;
     my $c = $f->c;
     my $r = $f->r;
 
-    my $mainr = $r->main || $r;
+    #my $mainr = $r->main || $r;
     unless ($f->ctx) {
         my $loc  = $r->headers_out->get('Location');
         if ($loc) {
-            # get the hostname of the request
+            my $match = $r->dir_config('MatchScheme') || '';
+            $match = scalar($match =~ $TRUE);
+
+            # get the hostname of the request, failing that, the server name
             my $host = $r->headers_in->get('Host')
                 || $r->server->server_hostname;
             $host = ($c->is_https ? 'https://' : 'http://') . $host;
             $host = URI->new($host)->canonical;
 
             # get the proxy base
-            my $base = URI->new($r->dir_config('ProxyTarget'));
-            $c->is_https ? $base->scheme('https') : $base->scheme('http');
+            my $base = URI->new($r->dir_config('ProxyTarget'))->canonical;
+            if ($match) {
+                $c->is_https ? $base->scheme('https') : $base->scheme('http');
+            }
 
-            # fix for malformed Location header
+            # fix for malformed (i.e. relative) Location header
             $loc = URI->new_abs($loc, $base);
             $loc = $loc->canonical;
 
-            $r->log->debug(sprintf 'Location is %s', $loc->authority);
+            $r->log->debug(sprintf'Location header is %s', $loc);
 
-            if ($loc->authority eq $base->authority) {
-                $r->log->debug
-                    ('Setting Location authority to %s', $host->authority);
+            # rewrite the authority if the Location header matches the target
+            if (lc($loc->authority) eq lc($base->authority)) {
+                $r->log->debug(sprintf 'Setting Location authority to %s',
+                               $host->authority);
                 $loc->authority($host->authority);
-                $r->headers_out->set(Location => $loc->as_string);
+                # don't let it redirect to itself
+                my $uri = URI->new_abs($r->unparsed_uri, $host);
+                if ($uri->eq($loc)) {
+                    $r->headers_out->unset('Location');
+                }
+                else {
+                    $r->headers_out->set(Location => $loc->as_string);
+                }
             }
         }
         $f->ctx(1);
