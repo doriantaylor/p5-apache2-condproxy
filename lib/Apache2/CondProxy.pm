@@ -17,6 +17,7 @@ use Apache2::ModSSL      ();
 use APR::Table           ();
 use APR::Bucket          ();
 use APR::Brigade         ();
+use APR::BucketType      ();
 
 use Apache2::Const -compile => qw(OK DECLINED SERVER_ERROR PROXYREQ_REVERSE);
 use APR::Const     -compile => qw(:common ENOTIMPL OVERLAP_TABLES_SET);
@@ -78,11 +79,11 @@ Apache2::CondProxy - Intelligent reverse proxy for missing resources
 
 =head1 VERSION
 
-Version 0.16
+Version 0.17
 
 =cut
 
-our $VERSION = '0.16';
+our $VERSION = '0.17';
 
 =head1 SYNOPSIS
 
@@ -159,6 +160,15 @@ This will cause the URI scheme in proxy requests (and C<Location>
 headers from proxied responses) to match that of the originating
 request, be it C<http> or C<https>.
 
+=head2 RemoteFirst
+
+    RemoteFirst on
+
+This will try to serve the resource at C<ProxyTarget> first and
+I<then> the local resource in case the remote resource responds with a
+404. Note: Under the hood, this still checks the local resource first,
+due to a limitation of C<mod_proxy>'s handling of subrequests.
+
 =cut
 
 # XXX this probably doesn't need to be a method handler
@@ -183,75 +193,108 @@ sub handler : method {
 
         $r->pnotes(CACHE, $dir);
 
-        my $uri = $r->unparsed_uri;
-        $r->log->debug("Attempting lookup on $uri");
-        my $subr = $r->lookup_method_uri($r->method, $uri);
+        my $rf = $r->dir_config('RemoteFirst') || '';
+        if ($rf =~ $TRUE) {
+            # this juggling is because mod_proxy eats non-main
+            # requests, which is why we have to subrequest the local
+            # resource in an output filter, then pipe that out as our
+            # response.
 
-        # set the content-type and content-length in the subrequest
-        my $ct = $r->headers_in->get('Content-Type');
-        $subr->headers_in->set('Content-Type', $ct) if $ct;
-        my $cl = $r->headers_in->get('Content-Length');
-        $subr->headers_in->set('Content-Length', $cl) if $cl;
-
-        # remove Accept-Encoding header for proxy
-        my $ae = $r->headers_in->get('Accept-Encoding');
-        $r->headers_in->unset('Accept-Encoding');
-        $subr->headers_in->unset('Accept-Encoding');
-
-        if ($subr->status == 404) {
-            $r->log->debug('Proxying before subrequest is run');
-            return _do_proxy($r);
-        }
-
-        $r->log->debug(sprintf 'Results inconclusive: %d; running subrequest',
-                       $subr->status);
-        $subr->add_input_filter(\&_input_filter_tee);
-        $subr->add_output_filter(\&_output_filter_hold);
-        my $rv = $subr->run;
-
-        # we only care about 404
-        my $st = $subr->status;
-        if (grep { $rv == $_ || $st == $_ } (403, 404)) {
-            $r->log->debug("Proxying $uri after subrequest is run");
-            return _do_proxy($r);
+            return _do_proxy($r, 1);
         }
         else {
-            # override the subrequest status
-            $subr->status($rv) if $subr->status != $rv && $rv != 0;
-            $r->status($subr->status);
+            my $uri = $r->unparsed_uri;
+            $r->log->debug("Attempting lookup on $uri");
+            my $subr = _make_subreq($r, $uri);
 
-            # replace Accept-Encoding header
-            $r->headers_in->set('Accept-Encoding', $ae) if $ae;
+            # set the content-type and content-length in the subrequest
+            my $ct = $r->headers_in->get('Content-Type');
+            $subr->headers_in->set('Content-Type', $ct) if $ct;
+            my $cl = $r->headers_in->get('Content-Length');
+            $subr->headers_in->set('Content-Length', $cl) if $cl;
+
+            # remove Accept-Encoding headers for proxy
+            my $ae = $r->headers_in->get('Accept-Encoding');
+            $r->headers_in->unset('Accept-Encoding');
+
+            if ($subr->status == 404) {
+                $r->log->debug('Proxying before subrequest is run');
+                return _do_proxy($r);
+            }
 
             $r->log->debug(
-                sprintf 'Subrequest returned %d; serving content for %s',
-                $subr->status, $uri);
+                sprintf 'Results inconclusive: %d; running subrequest',
+                $subr->status);
 
-            # copy headers from subreq
-            $r->headers_out->overlap
-                ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
-            $r->err_headers_out->overlap
-                ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
+            $subr->add_input_filter(\&_input_filter_tee);
+            $subr->add_output_filter(\&_output_filter_hold);
+            my $rv = $subr->run;
 
-            # apparently content_type has to be done separately
-            $r->log->debug($subr->content_type);
-            $r->content_type($subr->content_type) if $subr->content_type;
-            $r->content_encoding($subr->content_encoding)
-                if $subr->content_encoding;
-            $r->set_last_modified($subr->mtime) if $subr->mtime;
+            # we only care about 404
+            my $st = $subr->status;
+            if (grep { $rv == $_ || $st == $_ } (403, 404)) {
+                $r->log->debug("Proxying $uri after subrequest is run");
+                return _do_proxy($r);
+            }
+            else {
+                # override the subrequest status
+                $subr->status($rv) if $subr->status != $rv && $rv != 0;
+                $r->status($subr->status);
 
-            $r->SUPER::handler('modperl');
-            $r->set_handlers(PerlResponseHandler => \&_response_handler);
-            $r->push_handlers(PerlCleanupHandler => \&_cleanup_handler);
-            $r->add_output_filter(\&_output_filter_release);
+                # replace Accept-Encoding header
+                $r->headers_in->set('Accept-Encoding', $ae) if $ae;
+
+                $r->log->debug(
+                    sprintf 'Subrequest returned %d; serving content for %s',
+                    $subr->status, $uri);
+
+                # copy headers from subreq
+                $r->headers_out->overlap
+                    ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
+                $r->err_headers_out->overlap
+                    ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
+
+                # apparently content_type has to be done separately
+                #$r->log->debug($subr->content_type);
+                $r->content_type($subr->content_type) if $subr->content_type;
+                $r->content_encoding($subr->content_encoding)
+                    if $subr->content_encoding;
+                $r->set_last_modified($subr->mtime) if $subr->mtime;
+
+                $r->SUPER::handler('modperl');
+                $r->set_handlers(PerlResponseHandler => \&_response_handler);
+                $r->push_handlers(PerlCleanupHandler => \&_cleanup_handler);
+                $r->add_output_filter(\&_output_filter_release);
+
+                return Apache2::Const::OK;
+            }
         }
     }
 
     Apache2::Const::OK;
 }
 
+sub _make_subreq {
+    my ($r, $uri) = @_;
+
+    $uri = $r->unparsed_uri unless defined $uri;
+
+    my $subr = $r->lookup_method_uri($r->method, $uri);
+
+    # set the content-type and content-length in the subrequest
+    my $ct = $r->headers_in->get('Content-Type');
+    $subr->headers_in->set('Content-Type', $ct) if $ct;
+    my $cl = $r->headers_in->get('Content-Length');
+    $subr->headers_in->set('Content-Length', $cl) if $cl;
+
+    # remove this so no gzip filter etc happens
+    $subr->headers_in->unset('Accept-Encoding');
+
+    $subr;
+}
+
 sub _do_proxy {
-    my $r = shift;
+    my ($r, $first) = @_;
     my $c = $r->connection;
 
     my $base  = URI->new($r->dir_config('ProxyTarget'))->canonical;
@@ -270,10 +313,22 @@ sub _do_proxy {
     $r->filename(sprintf 'proxy:%s', $base);
     $r->proxyreq(Apache2::Const::PROXYREQ_REVERSE);
     $r->SUPER::handler('proxy-server');
-    $r->add_input_filter(\&_input_filter_replay);
+
     $r->add_output_filter(\&_output_filter_fix_location);
+    if ($first) {
+        $r->push_handlers(PerlCleanupHandler => \&_cleanup_handler);
+        $r->add_input_filter(\&_input_filter_tee);
+        $r->add_output_filter(\&_output_filter_local);
+    }
+    else {
+        $r->add_input_filter(\&_input_filter_replay);
+    }
 
     return Apache2::Const::OK;
+}
+
+sub _do_local {
+    my ($r, $subr) = @_;
 }
 
 
@@ -287,48 +342,55 @@ sub _output_filter_fix_location {
 
     #my $mainr = $r->main || $r;
     unless ($f->ctx) {
-        my $loc  = $r->headers_out->get('Location');
-        if ($loc) {
-            my $match = $r->dir_config('MatchScheme') || '';
-            $match = scalar($match =~ $TRUE);
-
-            # get the hostname of the request, failing that, the server name
-            my $host = $r->headers_in->get('Host')
-                || $r->server->server_hostname;
-            $host = ($c->is_https ? 'https://' : 'http://') . $host;
-            $host = URI->new($host)->canonical;
-
-            # get the proxy base
-            my $base = URI->new($r->dir_config('ProxyTarget'))->canonical;
-            if ($match) {
-                $c->is_https ? $base->scheme('https') : $base->scheme('http');
-            }
-
-            # fix for malformed (i.e. relative) Location header
-            $loc = URI->new_abs($loc, $base);
-            $loc = $loc->canonical;
-
-            $r->log->debug(sprintf'Location header is %s', $loc);
-
-            # rewrite the authority if the Location header matches the target
-            if (lc($loc->authority) eq lc($base->authority)) {
-                $r->log->debug(sprintf 'Setting Location authority to %s',
-                               $host->authority);
-                $loc->authority($host->authority);
-                # don't let it redirect to itself
-                my $uri = URI->new_abs($r->unparsed_uri, $host);
-                if ($uri->eq($loc)) {
-                    $r->headers_out->unset('Location');
-                }
-                else {
-                    $r->headers_out->set(Location => $loc->as_string);
-                }
-            }
-        }
+        _fix_location($r, $c);
         $f->ctx(1);
     }
 
     Apache2::Const::DECLINED;
+}
+
+sub _fix_location {
+    my $r = shift;
+    my $c = shift || $r->connection;
+
+    my $loc  = $r->headers_out->get('Location');
+    if ($loc) {
+        my $match = $r->dir_config('MatchScheme') || '';
+        $match = scalar($match =~ $TRUE);
+
+        # get the hostname of the request, failing that, the server name
+        my $host = $r->headers_in->get('Host')
+            || $r->server->server_hostname;
+        $host = ($c->is_https ? 'https://' : 'http://') . $host;
+        $host = URI->new($host)->canonical;
+
+        # get the proxy base
+        my $base = URI->new($r->dir_config('ProxyTarget'))->canonical;
+        if ($match) {
+            $c->is_https ? $base->scheme('https') : $base->scheme('http');
+        }
+
+        # fix for malformed (i.e. relative) Location header
+        $loc = URI->new_abs($loc, $base);
+        $loc = $loc->canonical;
+
+        $r->log->debug(sprintf'Location header is %s', $loc);
+
+        # rewrite the authority if the Location header matches the target
+        if (lc($loc->authority) eq lc($base->authority)) {
+            $r->log->debug(sprintf 'Setting Location authority to %s',
+                           $host->authority);
+            $loc->authority($host->authority);
+            # don't let it redirect to itself
+            my $uri = URI->new_abs($r->unparsed_uri, $host);
+            if ($uri->eq($loc)) {
+                $r->headers_out->unset('Location');
+            }
+            else {
+                $r->headers_out->set(Location => $loc->as_string);
+            }
+        }
+    }
 }
 
 sub _response_handler {
@@ -451,6 +513,19 @@ sub _input_filter_replay {
     APR::Const::SUCCESS;
 }
 
+sub _log_bucket_type {
+    my ($bb, $r, $message) = @_;
+
+    # let's see what this contains anyway
+    my @buckets;
+    my $b = $bb->first;
+    do {
+        push @buckets, $b->type->name;
+    } while ($b = $bb->next($b));
+
+    $r->log->debug($message . ': ' . join ', ', @buckets);
+}
+
 sub _output_filter_hold {
     my ($f, $bb) = @_;
     my $c = $f->c;
@@ -464,6 +539,8 @@ sub _output_filter_hold {
         $mainr->pnotes(BRIGADE, $saveto);
     }
 
+    _log_bucket_type($bb, $mainr, 'Hold filter contents');
+
     return $f->save_brigade($saveto, $bb, $c->pool);
 }
 
@@ -475,6 +552,63 @@ sub _output_filter_release {
     return Apache2::Const::DECLINED unless $bb->length;
 
     return $f->next->pass_brigade($bb);
+}
+
+sub _output_filter_local {
+    my ($f, $bb) = @_;
+
+    my $r = $f->r;
+
+
+    if ($r->status >= 400) {
+        # only run this filter once, but how it responds will depend
+        # on whether there was content in the subrequest's response
+        return $f->ctx if defined $f->ctx;
+        $f->ctx(Apache2::Const::DECLINED);
+
+        $r->log->debug('Executing ghetto-rigged local subreq filter');
+
+        my $subr = _make_subreq($r);
+        # these are some serious backflips, executing a subrequest
+        # in an output filter
+        $subr->add_input_filter(\&_input_filter_replay);
+        $subr->add_output_filter(\&_output_filter_hold);
+        $subr->run;
+
+        # _output_filter_hold will put the subrequest's response
+        # content in $r->pnotes(BRIGADE)
+        if (my $bbb = $r->pnotes(BRIGADE)) {
+            # nuke the original bucket brigade
+            $bb->destroy;
+
+            _log_bucket_type($bbb, $r, 'Release filter contents');
+
+            # overwrite the response code
+            $r->status($subr->status);
+
+            # copy headers from subreq
+            $r->headers_out->overlap
+                ($subr->headers_out, APR::Const::OVERLAP_TABLES_SET);
+            $r->err_headers_out->overlap
+                ($subr->err_headers_out, APR::Const::OVERLAP_TABLES_SET);
+
+            # apparently content_type has to be done separately
+            #$r->log->debug($subr->content_type);
+            $r->content_type($subr->content_type) if $subr->content_type;
+            $r->content_encoding($subr->content_encoding)
+                if $subr->content_encoding;
+            $r->set_last_modified($subr->mtime) if $subr->mtime;
+
+            $f->ctx(Apache2::Const::OK);
+
+            return $f->next->pass_brigade($bbb);
+        }
+        else {
+            $r->log->debug('no brigade in subrequest!');
+        }
+    }
+
+    Apache2::Const::DECLINED;
 }
 
 =head1 AUTHOR

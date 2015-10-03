@@ -23,6 +23,7 @@ PerlLoadModule Apache2::CondProxy
 PerlFixupHandler Apache2::CondProxy
 PerlSetVar ProxyTarget http://iainstitute.org
 PerlSetVar RequestBodyCache @ServerRoot@/tmp
+#PerlSetVar RemoteFirst on
 
 <Directory "@DocumentRoot@">
 AllowOverride all
